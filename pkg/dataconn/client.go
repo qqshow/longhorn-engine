@@ -100,6 +100,7 @@ func (c *Client) operation(op uint32, buf []byte, offset int64) (int, error) {
 			case TypeRead:
 				return time.After(opReadTimeout)
 			case TypeWrite:
+				logrus.Infof("WriteAt ", offset, "len ", msg.Size)
 				return time.After(opWriteTimeout)
 			}
 			return time.After(opPingTimeout)
