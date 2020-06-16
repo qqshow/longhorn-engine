@@ -88,7 +88,7 @@ RUN cd /usr/src && \
 RUN cd /usr/src && \
     git clone https://github.com/qqshow/tgt.git && \
     cd tgt && \
-    git checkout master && \
+    git checkout longhorn_oct2019 && \
     ./scripts/build-pkg.sh deb && \
     dpkg -i ./pkg/tgt_*.deb
 
