@@ -78,17 +78,17 @@ RUN wget -O /usr/bin/buf https://github.com/bufbuild/buf/releases/download/v0.16
 
 # Build liblonghorn
 RUN cd /usr/src && \
-    git clone https://github.com/rancher/liblonghorn.git && \
+    git clone https://github.com/qqshow/liblonghorn.git && \
     cd liblonghorn && \
-    git checkout 6592b9967d1b5acbb51a5596abfe0a0d7bad16dc && \
+    git checkout master && \
     make deb && \
     dpkg -i ./pkg/liblonghorn_*.deb
 
 # Build TGT
 RUN cd /usr/src && \
-    git clone https://github.com/rancher/tgt.git && \
+    git clone https://github.com/qqshow/tgt.git && \
     cd tgt && \
-    git checkout e042fdd3616ca90619637b5826695a3de9b5dd8e && \
+    git checkout master && \
     ./scripts/build-pkg.sh deb && \
     dpkg -i ./pkg/tgt_*.deb
 
@@ -99,9 +99,9 @@ RUN cd integration && tox --notest
 
 # Build longhorn-instance-manager
 RUN cd /go/src/github.com/longhorn && \
-    git clone https://github.com/longhorn/longhorn-instance-manager.git && \
+    git clone https://github.com/qqshow/longhorn-instance-manager.git && \
     cd longhorn-instance-manager && \
-    git checkout 7d0d17b63f653fb17ec188eefe05fe444e7199e9 && \
+    git checkout master && \
     go build -o ./longhorn-instance-manager && \
     cp -r integration/rpc/ ${DAPPER_SOURCE}/integration/rpc/ && \
     cp longhorn-instance-manager /usr/local/bin
