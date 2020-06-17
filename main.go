@@ -90,6 +90,7 @@ func longhornCli() {
 		if c.GlobalBool("debug") {
 			logrus.SetLevel(logrus.DebugLevel)
 		}
+		logrus.SetReportCaller(true)
 		return nil
 	}
 	a.Flags = []cli.Flag{
