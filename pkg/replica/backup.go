@@ -31,43 +31,112 @@ type DeltaBlockBackupOperations interface {
 */
 
 type RestoreStatus struct {
-	sync.Mutex
+	sync.RWMutex
 	replicaAddress string
-	SnapshotName   string //This will be deltaFileName in case of Incremental Restore
 	Progress       int
 	Error          string
 	BackupURL      string
 	State          ProgressState
 
-	//Incremental Restore fields
-	LastRestored     string
+	// The file that (temporarily) stores the data during the restoring.
+	ToFileName string
+	// The snapshot file that stores the restored data in the end.
 	SnapshotDiskName string
+
+	LastRestored           string
+	CurrentRestoringBackup string
 }
 
-func NewRestore(snapshotName, replicaAddress string) *RestoreStatus {
+func NewRestore(snapshotName, replicaAddress, backupURL, currentRestoringBackup string) *RestoreStatus {
 	return &RestoreStatus{
-		replicaAddress: replicaAddress,
-		SnapshotName:   snapshotName,
-		State:          ProgressStateInProgress,
+		replicaAddress:         replicaAddress,
+		ToFileName:             snapshotName,
+		SnapshotDiskName:       snapshotName,
+		State:                  ProgressStateInProgress,
+		Progress:               0,
+		BackupURL:              backupURL,
+		CurrentRestoringBackup: currentRestoringBackup,
 	}
 }
 
-func (rr *RestoreStatus) UpdateRestoreStatus(snapshot string, rp int, re error) {
-	rr.Lock()
-	defer rr.Unlock()
+func (status *RestoreStatus) StartNewRestore(backupURL, currentRestoringBackup, toFileName, snapshotDiskName string, validLastRestoredBackup bool) {
+	status.Lock()
+	defer status.Unlock()
+	status.ToFileName = toFileName
 
-	rr.SnapshotName = snapshot
-	rr.Progress = rp
+	status.Progress = 0
+	status.Error = ""
+	status.BackupURL = backupURL
+	status.State = ProgressStateInProgress
+	status.SnapshotDiskName = snapshotDiskName
+	if !validLastRestoredBackup {
+		status.LastRestored = ""
+	}
+	status.CurrentRestoringBackup = currentRestoringBackup
+}
+
+func (status *RestoreStatus) UpdateRestoreStatus(snapshot string, rp int, re error) {
+	status.Lock()
+	defer status.Unlock()
+
+	status.ToFileName = snapshot
+	status.Progress = rp
 	if re != nil {
-		rr.Error = re.Error()
-		rr.State = ProgressStateError
+		if status.Error != "" {
+			status.Error = fmt.Sprintf("%v: %v", re.Error(), status.Error)
+		} else {
+			status.Error = re.Error()
+		}
+		status.State = ProgressStateError
+		status.CurrentRestoringBackup = ""
 	}
 }
 
-func (rr *RestoreStatus) FinishRestore() {
-	rr.Lock()
-	defer rr.Unlock()
-	rr.State = ProgressStateComplete
+func (status *RestoreStatus) FinishRestore() {
+	status.Lock()
+	defer status.Unlock()
+	if status.State != ProgressStateError {
+		status.State = ProgressStateComplete
+		status.LastRestored = status.CurrentRestoringBackup
+		status.CurrentRestoringBackup = ""
+	}
+}
+
+// Revert is used for reverting the current restore status to the previous status.
+// This function will be invoked when:
+//     1. The new restore is failed before the actual restore is preformed.
+//     2. The existing files are not modified.
+//     3. The current status has been updated/initialized for the new restore.
+// If there is no modification applied on the existing replica disk files after the restore failure,
+// it means the replica is still available. In order to make sure the replica work fine
+// for the next restore and the status is not messed up, the revert is indispensable.
+func (status *RestoreStatus) Revert(previousStatus *RestoreStatus) {
+	status.Lock()
+	defer status.Unlock()
+
+	status.BackupURL = previousStatus.BackupURL
+	status.Progress = previousStatus.Progress
+	status.State = previousStatus.State
+	status.Error = previousStatus.Error
+	status.ToFileName = previousStatus.ToFileName
+	status.SnapshotDiskName = previousStatus.SnapshotDiskName
+	status.LastRestored = previousStatus.LastRestored
+	status.CurrentRestoringBackup = previousStatus.CurrentRestoringBackup
+}
+
+func (status *RestoreStatus) DeepCopy() *RestoreStatus {
+	status.RLock()
+	defer status.RUnlock()
+	return &RestoreStatus{
+		ToFileName:             status.ToFileName,
+		Progress:               status.Progress,
+		Error:                  status.Error,
+		LastRestored:           status.LastRestored,
+		SnapshotDiskName:       status.SnapshotDiskName,
+		BackupURL:              status.BackupURL,
+		State:                  status.State,
+		CurrentRestoringBackup: status.CurrentRestoringBackup,
+	}
 }
 
 type BackupStatus struct {
@@ -167,9 +236,6 @@ func (rb *BackupStatus) ReadSnapshot(snapID, volumeID string, start int64, data 
 	defer rb.lock.Unlock()
 	if err := rb.assertOpen(id, volumeID); err != nil {
 		return err
-	}
-	if rb.SnapshotID != id && rb.volumeID != volumeID {
-		return fmt.Errorf("Snapshot %s and volume %s are not open", id, volumeID)
 	}
 
 	_, err := rb.replica.ReadAt(data, start)

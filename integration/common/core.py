@@ -28,6 +28,8 @@ from common.constants import (
     PROC_STATE_STARTING, PROC_STATE_RUNNING,
     PROC_STATE_ERROR,
     ENGINE_NAME, EXPANDED_SIZE_STR,
+    VOLUME_NO_FRONTEND_NAME,
+    FIXED_REPLICA_PATH1, FIXED_REPLICA_PATH2,
 )
 
 thread_failed = False
@@ -87,11 +89,14 @@ def wait_for_process_error(client, name):
 def create_replica_process(client, name, replica_dir="",
                            args=[], binary=LONGHORN_BINARY,
                            size=SIZE, port_count=15,
-                           port_args=["--listen,localhost:"]):
+                           port_args=["--listen,localhost:"],
+                           disable_revision_counter=False):
     if not replica_dir:
         replica_dir = tempfile.mkdtemp()
     if not args:
         args = ["replica", replica_dir, "--size", str(size)]
+    if disable_revision_counter == True:
+        args += ["--disableRevCounter"]
     client.process_create(
         name=name, binary=binary, args=args,
         port_count=port_count, port_args=port_args)
@@ -105,10 +110,13 @@ def create_engine_process(client, name=ENGINE_NAME,
                           binary=LONGHORN_BINARY,
                           listen="", listen_ip="localhost",
                           size=SIZE, frontend=FRONTEND_TGT_BLOCKDEV,
-                          replicas=[], backends=["file"]):
+                          replicas=[], backends=["file"],
+                          disable_revision_counter=False):
     args = ["controller", volume_name]
     if frontend != "":
         args += ["--frontend", frontend]
+    if disable_revision_counter == True:
+        args += ["--disableRevCounter"]
     for r in replicas:
         args += ["--replica", r]
     for b in backends:
@@ -142,8 +150,37 @@ def cleanup_controller(grpc_client):
     return grpc_client
 
 
+# TODO: https://github.com/longhorn/longhorn/issues/1857
+# For some cases, we can not use get_replica to add the retry,
+# Because the grpc_client.replica_get() will error out.
+def get_replica_client_with_delay(grpc_client):
+    time.sleep(3)
+    return grpc_client
+
+
+# TODO: https://github.com/longhorn/longhorn/issues/1857
+def get_replica(grpc_client):
+    retry_cnt = 3
+    while retry_cnt != 0:
+        try:
+            r = grpc_client.replica_get()
+        except grpc.RpcError as grpc_err:
+            if "Socket closed" not in grpc_err.details():
+                raise(grpc_err)
+            print("wait for sometime, and try again")
+            time.sleep(1)
+            retry_cnt -= 1
+        else:
+            break
+    if retry_cnt == 0:
+        print("Failed to run grpc_client with e", grpc_err)
+        raise(grpc_err)
+
+    return r
+
+
 def cleanup_replica(grpc_client):
-    r = grpc_client.replica_get()
+    r = get_replica(grpc_client)
     if r.state == 'initial':
         return grpc_client
     if r.state == 'closed':
@@ -152,6 +189,26 @@ def cleanup_replica(grpc_client):
     r = grpc_client.replica_reload()
     assert r.state == 'initial'
     return grpc_client
+
+
+# TODO: https://github.com/longhorn/longhorn/issues/1857
+def get_controller_version_detail(grpc_controller_client):
+    retry_cnt = 3
+    while retry_cnt != 0:
+        try:
+            c = grpc_controller_client.version_detail_get()
+        except grpc.RpcError as grpc_err:
+            if "Socket closed" not in grpc_err.details():
+                raise(grpc_err)
+            print("wait for sometime, and try again")
+            time.sleep(1)
+            retry_cnt -= 1
+        else:
+            break
+
+    if retry_cnt == 0:
+        print("Failed to run grpc_client with e", grpc_err)
+        raise(grpc_err)
 
 
 def random_str():
@@ -287,13 +344,90 @@ def restore_with_frontend(url, engine_name, backup):
     cmd.backup_restore(url, backup)
     wait_for_restore_completion(url, backup)
     client.volume_frontend_start(FRONTEND_TGT_BLOCKDEV)
+    v = client.volume_get()
+    assert v.frontendState == "up"
     return
 
 
-def restore_incrementally(url, backup_url, last_restored):
-    cmd.restore_inc(url, backup_url, last_restored)
-    wait_for_restore_completion(url, backup_url)
-    return
+def verify_no_frontend_data(data_offset, data, grpc_c):
+    grpc_c.volume_frontend_start(FRONTEND_TGT_BLOCKDEV)
+    v = grpc_c.volume_get()
+    assert v.frontendState == "up"
+
+    dev = get_blockdev(volume=VOLUME_NO_FRONTEND_NAME)
+    verify_read(dev, data_offset, data)
+
+    grpc_c.volume_frontend_shutdown()
+    v = grpc_c.volume_get()
+    assert v.frontendState == "down"
+
+
+def start_no_frontend_volume(grpc_c, *grpc_r_list):
+    assert len(grpc_r_list) > 0
+
+    grpc_c.volume_frontend_start(FRONTEND_TGT_BLOCKDEV)
+
+    for grpc_r in grpc_r_list:
+        open_replica(grpc_r)
+
+    v = grpc_c.volume_start(
+        replicas=[grpc_r.url for grpc_r in grpc_r_list])
+    assert v.replicaCount == len(grpc_r_list)
+
+    dr_replicas = grpc_c.replica_list()
+    assert len(dr_replicas) == len(grpc_r_list)
+
+    grpc_c.volume_frontend_shutdown()
+    v = grpc_c.volume_get()
+    assert v.frontendState == "down"
+
+
+def cleanup_no_frontend_volume(grpc_c, *grpc_r_list):
+    grpc_c.volume_frontend_start(FRONTEND_TGT_BLOCKDEV)
+    v = grpc_c.volume_get()
+    assert v.frontendState == "up"
+
+    cmd.sync_agent_server_reset(grpc_c.address)
+
+    grpc_c.volume_frontend_shutdown()
+    v = grpc_c.volume_get()
+    assert v.frontendState == "down"
+
+    cleanup_controller(grpc_c)
+    for grpc_r in grpc_r_list:
+        cleanup_replica(grpc_r)
+
+    cleanup_replica_dir(FIXED_REPLICA_PATH1)
+    cleanup_replica_dir(FIXED_REPLICA_PATH2)
+
+
+def reset_volume(grpc_c, *grpc_r_list):
+    complete = True
+    for i in range(RETRY_COUNTS_SHORT):
+        complete = True
+        cmd.sync_agent_server_reset(grpc_c.address)
+        cleanup_controller(grpc_c)
+        for grpc_r in grpc_r_list:
+            cleanup_replica(grpc_r)
+            open_replica(grpc_r)
+        # TODO: A simple workaround of race condition.
+        #  See https://github.com/longhorn/longhorn/issues/1628 for details.
+        time.sleep(1)
+        v = grpc_c.volume_start(
+            replicas=[grpc_r.url for grpc_r in grpc_r_list])
+        rs = grpc_c.replica_list()
+        if len(rs) != len(grpc_r_list):
+            complete = False
+        else:
+            for r_info in rs:
+                if r_info.mode != 'RW':
+                    complete = False
+                    break
+        if complete:
+            break
+        time.sleep(RETRY_INTERVAL)
+    assert complete
+    return v
 
 
 def create_backup(url, snap, backup_target, volume_size=SIZE_STR):
@@ -441,6 +575,25 @@ def verify_replica_state(grpc_c, addr, state):
     assert verified
 
 
+def verify_replica_mode(grpc_c, addr, mode):
+    if not addr.startswith("tcp://"):
+        addr = "tcp://" + addr
+
+    verified = False
+    for i in range(RETRY_COUNTS_SHORT):
+        replicas = grpc_c.replica_list()
+        snapList = cmd.snapshot_ls(grpc_c.address)
+        for r in replicas:
+            if r.address == addr and r.mode == mode:
+                verified = True
+                break
+        if verified:
+            break
+
+        time.sleep(RETRY_INTERVAL_SHORT)
+    assert verified
+
+
 def verify_read(dev, offset, data):
     for i in range(10):
         readed = read_dev(dev, offset, len(data))
@@ -470,39 +623,10 @@ def get_dev(grpc_replica1, grpc_replica2, grpc_controller,
             clean_backup_dir=True):
     if clean_backup_dir:
         prepare_backup_dir(BACKUP_DIR)
-    open_replica(grpc_replica1)
-    open_replica(grpc_replica2)
 
-    replicas = grpc_controller.replica_list()
-    assert len(replicas) == 0
+    v = reset_volume(grpc_controller, grpc_replica1, grpc_replica2)
 
-    r1_url = grpc_replica1.url
-    r2_url = grpc_replica2.url
-    v = grpc_controller.volume_start(replicas=[r1_url, r2_url])
-    assert v.replicaCount == 2
-    d = get_blockdev(v.name)
-
-    return d
-
-
-def get_backing_dev(grpc_backing_replica1, grpc_backing_replica2,
-                    grpc_backing_controller):
-    prepare_backup_dir(BACKUP_DIR)
-    open_replica(grpc_backing_replica1)
-    open_replica(grpc_backing_replica2)
-
-    replicas = grpc_backing_controller.replica_list()
-    assert len(replicas) == 0
-
-    r1_url = grpc_backing_replica1.url
-    r2_url = grpc_backing_replica2.url
-    v = grpc_backing_controller.volume_start(
-        replicas=[r1_url, r2_url])
-    assert v.name == VOLUME_BACKING_NAME
-    assert v.replicaCount == 2
-    d = get_blockdev(v.name)
-
-    return d
+    return get_blockdev(v.name)
 
 
 def random_offset(size, existings={}):

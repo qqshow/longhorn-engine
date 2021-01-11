@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 
 	"github.com/pkg/errors"
@@ -107,14 +108,16 @@ func (c *Controller) VerifyRebuildReplica(address string) error {
 		}
 	}
 
-	counter, err := c.backend.GetRevisionCounter(rwReplica.Address)
-	if err != nil || counter == -1 {
-		return fmt.Errorf("Failed to get revision counter of RW Replica %v: counter %v, err %v",
-			rwReplica.Address, counter, err)
+	if !c.revisionCounterDisabled {
+		counter, err := c.backend.GetRevisionCounter(rwReplica.Address)
+		if err != nil || counter == -1 {
+			return fmt.Errorf("Failed to get revision counter of RW Replica %v: counter %v, err %v",
+				rwReplica.Address, counter, err)
 
-	}
-	if err := c.backend.SetRevisionCounter(address, counter); err != nil {
-		return fmt.Errorf("Fail to set revision counter for %v: %v", address, err)
+		}
+		if err := c.backend.SetRevisionCounter(address, counter); err != nil {
+			return fmt.Errorf("Fail to set revision counter for %v: %v", address, err)
+		}
 	}
 
 	logrus.Infof("WO replica %v's chain verified, update mode to RW", address)
@@ -144,12 +147,14 @@ func syncFile(from, to string, fromReplica, toReplica *types.Replica) error {
 		return err
 	}
 
-	logrus.Infof("Synchronizing %s to %s@%s:%d", from, to, host, port)
+	strHostPort := net.JoinHostPort(host, strconv.Itoa(int(port)))
+
+	logrus.Infof("Synchronizing %s to %s@%s", from, to, strHostPort)
 	err = fromClient.SendFile(from, host, port)
 	if err != nil {
-		logrus.Infof("Failed synchronizing %s to %s@%s:%d: %v", from, to, host, port, err)
+		logrus.Infof("Failed synchronizing %s to %s@%s: %v", from, to, strHostPort, err)
 	} else {
-		logrus.Infof("Done synchronizing %s to %s@%s:%d", from, to, host, port)
+		logrus.Infof("Done synchronizing %s to %s@%s", from, to, strHostPort)
 	}
 
 	return err
@@ -159,8 +164,10 @@ func (c *Controller) PrepareRebuildReplica(address string) ([]types.SyncFileInfo
 	c.Lock()
 	defer c.Unlock()
 
-	if err := c.backend.SetRevisionCounter(address, 0); err != nil {
-		return nil, fmt.Errorf("Fail to set revision counter for %v: %v", address, err)
+	if !c.revisionCounterDisabled {
+		if err := c.backend.SetRevisionCounter(address, 0); err != nil {
+			return nil, fmt.Errorf("Fail to set revision counter for %v: %v", address, err)
+		}
 	}
 
 	replica, rwReplica, err := c.getCurrentAndRWReplica(address)

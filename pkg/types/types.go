@@ -23,6 +23,12 @@ const (
 	AWSEndPoint  = "AWS_ENDPOINTS"
 	AWSCert      = "AWS_CERT"
 
+	HTTPSProxy = "HTTPS_PROXY"
+	HTTPProxy  = "HTTP_PROXY"
+	NOProxy    = "NO_PROXY"
+
+	VirtualHostedStyle = "VIRTUAL_HOSTED_STYLE"
+
 	RetryCounts   = 30
 	RetryInterval = 1 * time.Second
 
@@ -56,6 +62,9 @@ type Backend interface {
 	SetRevisionCounter(counter int64) error
 	GetMonitorChannel() MonitorChannel
 	StopMonitoring()
+	IsRevisionCounterDisabled() (bool, error)
+	GetLastModifyTime() (int64, error)
+	GetHeadFileSize() (int64, error)
 }
 
 type BackendFactory interface {
@@ -85,6 +94,11 @@ type State string
 type Replica struct {
 	Address string
 	Mode    Mode
+}
+
+type ReplicaSalvageInfo struct {
+	LastModifyTime int64
+	HeadFileSize   int64
 }
 
 type Frontend interface {

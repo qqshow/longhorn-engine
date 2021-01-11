@@ -21,17 +21,19 @@ type State string
 
 type Server struct {
 	sync.RWMutex
-	r                 *Replica
-	dir               string
-	defaultSectorSize int64
-	backing           *BackingFile
+	r                       *Replica
+	dir                     string
+	defaultSectorSize       int64
+	backing                 *BackingFile
+	revisionCounterDisabled bool
 }
 
-func NewServer(dir string, backing *BackingFile, sectorSize int64) *Server {
+func NewServer(dir string, backing *BackingFile, sectorSize int64, disableRevCounter bool) *Server {
 	return &Server{
-		dir:               dir,
-		backing:           backing,
-		defaultSectorSize: sectorSize,
+		dir:                     dir,
+		backing:                 backing,
+		defaultSectorSize:       sectorSize,
+		revisionCounterDisabled: disableRevCounter,
 	}
 }
 
@@ -62,7 +64,7 @@ func (s *Server) Create(size int64) error {
 	sectorSize := s.getSectorSize()
 
 	logrus.Infof("Creating volume %s, size %d/%d", s.dir, size, sectorSize)
-	r, err := New(size, sectorSize, s.dir, s.backing)
+	r, err := New(size, sectorSize, s.dir, s.backing, s.revisionCounterDisabled)
 	if err != nil {
 		return err
 	}
@@ -83,7 +85,7 @@ func (s *Server) Open() error {
 	sectorSize := s.getSectorSize()
 
 	logrus.Infof("Opening volume %s, size %d/%d", s.dir, size, sectorSize)
-	r, err := New(size, sectorSize, s.dir, s.backing)
+	r, err := New(size, sectorSize, s.dir, s.backing, s.revisionCounterDisabled)
 	if err != nil {
 		return err
 	}
@@ -123,6 +125,8 @@ func (s *Server) Status() (State, Info) {
 	}
 	info := s.r.Info()
 	switch {
+	case info.Error != "":
+		return Error, info
 	case info.Rebuilding:
 		return Rebuilding, info
 	case info.Dirty:
@@ -214,7 +218,7 @@ func (s *Server) ReplaceDisk(target, source string) error {
 		return nil
 	}
 
-	logrus.Infof("Replacing disk %v with %v", target, source)
+	logrus.Infof("Replacing disk %v with %v", source, target)
 	return s.r.ReplaceDisk(target, source)
 }
 
@@ -310,7 +314,10 @@ func (s *Server) SetRevisionCounter(counter int64) error {
 }
 
 func (s *Server) PingResponse() error {
-	state, _ := s.Status()
+	state, info := s.Status()
+	if state == Error {
+		return fmt.Errorf("ping failure due to %v", info.Error)
+	}
 	if state != Open && state != Dirty && state != Rebuilding {
 		return fmt.Errorf("ping failure: replica state %v", state)
 	}

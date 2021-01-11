@@ -15,10 +15,21 @@ import (
 	"github.com/longhorn/longhorn-engine/pkg/types"
 )
 
-const VolumeHeadName = "volume-head"
+const (
+	VolumeHeadName = "volume-head"
+)
 
 type Task struct {
 	client *client.ControllerClient
+}
+
+type TaskError struct {
+	ReplicaErrors []ReplicaError
+}
+
+type ReplicaError struct {
+	Address string
+	Message string
 }
 
 type SnapshotPurgeStatus struct {
@@ -34,6 +45,46 @@ type ReplicaRebuildStatus struct {
 	Progress           int    `json:"progress"`
 	State              string `json:"state"`
 	FromReplicaAddress string `json:"fromReplicaAddress"`
+}
+
+func NewTaskError(res ...ReplicaError) *TaskError {
+	return &TaskError{
+		ReplicaErrors: append([]ReplicaError{}, res...),
+	}
+}
+
+func (e *TaskError) Error() string {
+	var errs []string
+	for _, re := range e.ReplicaErrors {
+		errs = append(errs, re.Error())
+	}
+
+	if errs == nil {
+		return "Unknown"
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	return strings.Join(errs, "; ")
+}
+
+func (e *TaskError) Append(re ReplicaError) {
+	e.ReplicaErrors = append(e.ReplicaErrors, re)
+}
+
+func (e *TaskError) HasError() bool {
+	return len(e.ReplicaErrors) != 0
+}
+
+func NewReplicaError(address string, err error) ReplicaError {
+	return ReplicaError{
+		Address: address,
+		Message: err.Error(),
+	}
+}
+
+func (e ReplicaError) Error() string {
+	return fmt.Sprintf("%v: %v", e.Address, e.Message)
 }
 
 func NewTask(controller string) *Task {
@@ -73,21 +124,26 @@ func (t *Task) PurgeSnapshots(skip bool) error {
 		return err
 	}
 
+	taskErr := NewTaskError()
 	for _, r := range replicas {
 		if ok, err := t.isRebuilding(r); err != nil {
-			return err
+			taskErr.Append(NewReplicaError(r.Address, err))
 		} else if ok {
-			return fmt.Errorf("cannot purge snapshots because %s is rebuilding", r.Address)
+			taskErr.Append(NewReplicaError(r.Address, fmt.Errorf("cannot purge snapshots because %s is rebuilding", r.Address)))
 		}
 
 		if ok, err := t.isPurging(r); err != nil {
-			return err
+			taskErr.Append(NewReplicaError(r.Address, err))
 		} else if ok {
 			if skip {
 				return nil
 			}
-			return fmt.Errorf("cannot purge snapshots because %s is already purging snapshots", r.Address)
+			taskErr.Append(NewReplicaError(r.Address, fmt.Errorf("cannot purge snapshots because %s is already purging snapshots", r.Address)))
 		}
+	}
+
+	if taskErr.HasError() {
+		return taskErr
 	}
 
 	errorMap := sync.Map{}
@@ -112,16 +168,20 @@ func (t *Task) PurgeSnapshots(skip bool) error {
 	}
 
 	wg.Wait()
+
 	for _, r := range replicas {
 		if v, ok := errorMap.Load(r.Address); ok {
 			err = v.(error)
 			if skip && types.IsAlreadyPurgingError(err) {
 				continue
 			}
-			logrus.Errorf("replica %v failed to start snapshot purge: %v", r.Address, err)
+			taskErr.Append(NewReplicaError(r.Address, err))
 		}
 	}
 
+	if taskErr.HasError() {
+		return taskErr
+	}
 	return nil
 }
 
@@ -242,6 +302,59 @@ func find(list []string, item string) int {
 	return -1
 }
 
+func (t *Task) AddRestoreReplica(replica string) error {
+	volume, err := t.client.VolumeGet()
+	if err != nil {
+		return err
+	}
+
+	if volume.ReplicaCount == 0 {
+		return t.client.VolumeStart(replica)
+	}
+
+	if err := t.checkRestoreReplicaSize(replica, volume.Size); err != nil {
+		return err
+	}
+
+	logrus.Infof("Adding restore replica %s in WO mode", replica)
+
+	// The replica mode will become RW after the first restoration complete.
+	// And the rebuilding flag in the replica server won't be set since this is not normal rebuilding.
+	if _, err = t.client.ReplicaCreate(replica, false, types.WO); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *Task) checkRestoreReplicaSize(address string, volumeSize int64) error {
+	replicaCli, err := replicaClient.NewReplicaClient(address)
+	if err != nil {
+		return err
+	}
+
+	replicaInfo, err := replicaCli.GetReplica()
+	if err != nil {
+		return err
+	}
+	replicaSize, err := strconv.ParseInt(replicaInfo.Size, 10, 64)
+	if err != nil {
+		return err
+	}
+	if replicaSize != volumeSize {
+		return fmt.Errorf("rebuilding replica size %v is not the same as volume size %v", replicaSize, volumeSize)
+	}
+
+	return nil
+}
+
+func (t *Task) VerifyRebuildReplica(address string) error {
+	if err := t.client.ReplicaVerifyRebuild(address); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (t *Task) AddReplica(replica string) error {
 	volume, err := t.client.VolumeGet()
 	if err != nil {
@@ -261,7 +374,7 @@ func (t *Task) AddReplica(replica string) error {
 	}
 
 	logrus.Infof("Adding replica %s in WO mode", replica)
-	_, err = t.client.ReplicaCreate(replica)
+	_, err = t.client.ReplicaCreate(replica, true, types.WO)
 	if err != nil {
 		return err
 	}
@@ -337,7 +450,7 @@ func (t *Task) checkAndExpandReplica(address string, size int64) error {
 		return err
 	}
 	if replicaSize > size {
-		return fmt.Errorf("cannot add a larger replica to the engine")
+		return fmt.Errorf("cannot add new replica larger than size %v", size)
 	} else if replicaSize < size {
 		logrus.Infof("Prepare to expand new replica to size %v", size)
 		needClose := false
@@ -562,6 +675,15 @@ func (t *Task) RebuildStatus() (map[string]*ReplicaRebuildStatus, error) {
 		repClient, err := replicaClient.NewReplicaClient(r.Address)
 		if err != nil {
 			return nil, err
+		}
+
+		restoreStatus, err := repClient.RestoreStatus()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to check the restore status before fetching the rebuild status")
+		}
+		if restoreStatus.DestFileName != "" {
+			logrus.Debugf("Skip checking rebuild status since the volume is a restore/DR volume")
+			return replicaStatusMap, nil
 		}
 
 		status, err := repClient.ReplicaRebuildStatus()
