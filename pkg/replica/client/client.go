@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -38,20 +39,20 @@ func NewReplicaClient(address string) (*ReplicaClient, error) {
 		address = strings.TrimSuffix(address, "/v1")
 	}
 
-	parts := strings.Split(address, ":")
-	if len(parts) < 2 {
+	host, strPort, err := net.SplitHostPort(address)
+	if err != nil {
 		return nil, fmt.Errorf("Invalid address %s, must have a port in it", address)
 	}
 
-	port, err := strconv.Atoi(parts[1])
+	port, err := strconv.Atoi(strPort)
 	if err != nil {
 		return nil, err
 	}
 
-	syncAgentServiceURL := strings.Replace(address, fmt.Sprintf(":%d", port), fmt.Sprintf(":%d", port+2), -1)
+	syncAgentServiceURL := net.JoinHostPort(host, strconv.Itoa(port+2))
 
 	return &ReplicaClient{
-		host:                parts[0],
+		host:                host,
 		replicaServiceURL:   address,
 		syncAgentServiceURL: syncAgentServiceURL,
 	}, nil
@@ -78,18 +79,21 @@ func GetDiskInfo(info *ptypes.DiskInfo) *types.DiskInfo {
 
 func GetReplicaInfo(r *ptypes.Replica) *types.ReplicaInfo {
 	replicaInfo := &types.ReplicaInfo{
-		Dirty:           r.Dirty,
-		Rebuilding:      r.Rebuilding,
-		Head:            r.Head,
-		Parent:          r.Parent,
-		Size:            r.Size,
-		SectorSize:      r.SectorSize,
-		BackingFile:     r.BackingFile,
-		State:           r.State,
-		Chain:           r.Chain,
-		Disks:           map[string]types.DiskInfo{},
-		RemainSnapshots: int(r.RemainSnapshots),
-		RevisionCounter: r.RevisionCounter,
+		Dirty:                   r.Dirty,
+		Rebuilding:              r.Rebuilding,
+		Head:                    r.Head,
+		Parent:                  r.Parent,
+		Size:                    r.Size,
+		SectorSize:              r.SectorSize,
+		BackingFile:             r.BackingFile,
+		State:                   r.State,
+		Chain:                   r.Chain,
+		Disks:                   map[string]types.DiskInfo{},
+		RemainSnapshots:         int(r.RemainSnapshots),
+		RevisionCounter:         r.RevisionCounter,
+		LastModifyTime:          r.LastModifyTime,
+		HeadFileSize:            r.HeadFileSize,
+		RevisionCounterDisabled: r.RevisionCounterDisabled,
 	}
 
 	for diskName, diskInfo := range r.Disks {
@@ -521,7 +525,7 @@ func (c *ReplicaClient) RmBackup(backup string) error {
 	return nil
 }
 
-func (c *ReplicaClient) RestoreBackup(backup, snapshotFile string, credential map[string]string) error {
+func (c *ReplicaClient) RestoreBackup(backup, snapshotDiskName string, credential map[string]string) error {
 	conn, err := grpc.Dial(c.syncAgentServiceURL, grpc.WithInsecure())
 	if err != nil {
 		return fmt.Errorf("cannot connect to SyncAgentService %v: %v", c.syncAgentServiceURL, err)
@@ -534,39 +538,15 @@ func (c *ReplicaClient) RestoreBackup(backup, snapshotFile string, credential ma
 
 	if _, err := syncAgentServiceClient.BackupRestore(ctx, &ptypes.BackupRestoreRequest{
 		Backup:           backup,
-		SnapshotFileName: snapshotFile,
+		SnapshotDiskName: snapshotDiskName,
 		Credential:       credential,
 	}); err != nil {
-		return fmt.Errorf("failed to restore backup %v to snapshot %v: %v", backup, snapshotFile, err)
+		return fmt.Errorf("failed to restore backup data %v to snapshot file %v: %v", backup, snapshotDiskName, err)
 	}
 
 	return nil
 }
 
-func (c *ReplicaClient) RestoreBackupIncrementally(backup, deltaFile, lastRestored,
-	snapshotDiskName string, credential map[string]string) error {
-	conn, err := grpc.Dial(c.syncAgentServiceURL, grpc.WithInsecure())
-	if err != nil {
-		return fmt.Errorf("cannot connect to SyncAgentService %v: %v", c.syncAgentServiceURL, err)
-	}
-	defer conn.Close()
-	syncAgentServiceClient := ptypes.NewSyncAgentServiceClient(conn)
-
-	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceCommonTimeout)
-	defer cancel()
-
-	if _, err := syncAgentServiceClient.BackupRestoreIncrementally(ctx, &ptypes.BackupRestoreIncrementallyRequest{
-		Backup:                 backup,
-		DeltaFileName:          deltaFile,
-		LastRestoredBackupName: lastRestored,
-		Credential:             credential,
-		SnapshotDiskName:       snapshotDiskName,
-	}); err != nil {
-		return fmt.Errorf("failed to incrementally restore backup %v to file %v: %v", backup, deltaFile, err)
-	}
-
-	return nil
-}
 func (c *ReplicaClient) Reset() error {
 	conn, err := grpc.Dial(c.syncAgentServiceURL, grpc.WithInsecure())
 	if err != nil {
